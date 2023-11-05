@@ -3,16 +3,10 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import findWorkspaceRoot = require('../node_modules/find-yarn-workspace-root');
-import * as findUp from 'find-up';
 import * as path from 'path';
-import * as whichPM from 'which-pm';
 import { Uri, workspace } from 'vscode';
+import { parseTree, findNodeAtLocation } from 'jsonc-parser';
 
-interface PreferredProperties {
-	isPreferred: boolean;
-	hasLockfile: boolean;
-}
 
 async function pathExists(filePath: string) {
 	try {
@@ -23,71 +17,36 @@ async function pathExists(filePath: string) {
 	return true;
 }
 
-async function isPNPMPreferred(pkgPath: string): Promise<PreferredProperties> {
-	if (await pathExists(path.join(pkgPath, 'pnpm-lock.yaml'))) {
-		return { isPreferred: true, hasLockfile: true };
-	}
-	if (await pathExists(path.join(pkgPath, 'shrinkwrap.yaml'))) {
-		return { isPreferred: true, hasLockfile: true };
-	}
-	if (await findUp('pnpm-lock.yaml', { cwd: pkgPath })) {
-		return { isPreferred: true, hasLockfile: true };
-	}
-
-	return { isPreferred: false, hasLockfile: false };
-}
-
-async function isYarnPreferred(pkgPath: string): Promise<PreferredProperties> {
-	if (await pathExists(path.join(pkgPath, 'yarn.lock'))) {
-		return { isPreferred: true, hasLockfile: true };
-	}
-
-	try {
-		if (typeof findWorkspaceRoot(pkgPath) === 'string') {
-			return { isPreferred: true, hasLockfile: false };
-		}
-	} catch (err) { }
-
-	return { isPreferred: false, hasLockfile: false };
-}
-
-async function isNPMPreferred(pkgPath: string): Promise<PreferredProperties> {
-	const lockfileExists = await pathExists(path.join(pkgPath, 'package-lock.json'));
-	return { isPreferred: lockfileExists, hasLockfile: lockfileExists };
-}
-
 export async function findPreferredPM(pkgPath: string): Promise<{ name: string; multipleLockFilesDetected: boolean }> {
 	const detectedPackageManagerNames: string[] = [];
-	const detectedPackageManagerProperties: PreferredProperties[] = [];
-
-	const npmPreferred = await isNPMPreferred(pkgPath);
-	if (npmPreferred.isPreferred) {
-		detectedPackageManagerNames.push('npm');
-		detectedPackageManagerProperties.push(npmPreferred);
+	let has_npm_lock = false;
+	let has_pnpm_lock = false;
+	let has_yarn_lock = false;
+	let name;
+	for (let p = pkgPath; p !== path.dirname(p); p = path.dirname(p)) {
+		const f = path.join(p, 'package.json');
+		const t = await workspace.openTextDocument(f);
+		const text = t.getText();
+		const parseResult = parseTree(text);
+		if (parseResult) {
+			const node = findNodeAtLocation(parseResult, ['packageManager']);
+			const val = node?.value;
+			if (val) {
+				name = val.split('@')[0];
+			}
+		}
+		has_npm_lock ||= await pathExists(path.join(p, 'package-lock.json')) || await pathExists(path.join(p, 'npm-shrinkwrap.json'));
+		if (has_npm_lock) { name ||= 'npm'; }
+		has_pnpm_lock ||= await pathExists(path.join(p, 'pnpm-lock.yaml')) || await pathExists(path.join(p, 'shrinkwrap.yaml'));
+		if (has_pnpm_lock) { name ||= 'pnpm'; }
+		has_yarn_lock ||= await pathExists(path.join(p, 'yarn.lock'));
+		if (has_yarn_lock) { name ||= 'yarn'; }
+		if (name) { break; }
 	}
 
-	const pnpmPreferred = await isPNPMPreferred(pkgPath);
-	if (pnpmPreferred.isPreferred) {
-		detectedPackageManagerNames.push('pnpm');
-		detectedPackageManagerProperties.push(pnpmPreferred);
-	}
+	name ||= 'npm';
 
-	const yarnPreferred = await isYarnPreferred(pkgPath);
-	if (yarnPreferred.isPreferred) {
-		detectedPackageManagerNames.push('yarn');
-		detectedPackageManagerProperties.push(yarnPreferred);
-	}
-
-	const pmUsedForInstallation: { name: string } | null = await whichPM(pkgPath);
-
-	if (pmUsedForInstallation && !detectedPackageManagerNames.includes(pmUsedForInstallation.name)) {
-		detectedPackageManagerNames.push(pmUsedForInstallation.name);
-		detectedPackageManagerProperties.push({ isPreferred: true, hasLockfile: false });
-	}
-
-	let lockfilesCount = 0;
-	detectedPackageManagerProperties.forEach(detected => lockfilesCount += detected.hasLockfile ? 1 : 0);
-
+	const lockfilesCount = Number(has_npm_lock) + Number(has_pnpm_lock) + Number(has_yarn_lock);
 	return {
 		name: detectedPackageManagerNames[0] || 'npm',
 		multipleLockFilesDetected: lockfilesCount > 1
